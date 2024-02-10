@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <curl/curl.h>
 
 #define MAX_NAME_LENGTH  NAME_LENGTH
@@ -42,19 +43,34 @@ struct PACKET_DISCORD_MESSAGE {
     char message[MAX_MESSAGE_LENGTH];
 } __attribute__((packed));
 
-void hercules_echo(struct channel_data *chan, struct map_session_data *sd, const char *msg) {
-    if (strncmp(sd->status.name, "<", 1) == 0) return;
+struct PostHookChannelSendParams {
+    struct channel_data *chan;
+    struct map_session_data *sd;
+    const char *msg;
+};
+
+void* async_hercules_echo(void *arg) {
+    // Cast the void pointer to the correct type
+    struct PostHookChannelSendParams *params = (struct PostHookChannelSendParams *)arg;
+
+    // Access the parameters
+    struct channel_data *chan = params->chan;
+    struct map_session_data *sd = params->sd;
+    const char *msg = params->msg;
+
+    // Handle after send message to channel
+    ShowDebug("async_hercules_echo: Sending message to channel: %s\n", chan->name);
 
     CURL *curl = curl_easy_init();
     if (!curl) {
-        ShowError("Failed to initialize CURL.\n");
-        return;
+        ShowError("async_hercules_echo: Failed to initialize CURL.\n");
+        return NULL;
     }
 
     const char *webhook_urls[] = {
-        "https://discord.com/api/webhooks/webhook_id/webhook_token",    // main
-        "https://discord.com/api/webhooks/webhook_id/webhook_token",    // trade
-        "https://discord.com/api/webhooks/webhook_id/webhook_token"    // support
+        "https://discord.com/api/webhooks/webhook_id/webhook_token",
+        "https://discord.com/api/webhooks/webhook_id/webhook_token",
+        "https://discord.com/api/webhooks/webhook_id/webhook_token"
     };
 
     const char *webhook_url = NULL;
@@ -65,9 +81,9 @@ void hercules_echo(struct channel_data *chan, struct map_session_data *sd, const
     } else if (strcmp(chan->name, "support") == 0) {
         webhook_url = webhook_urls[2];
     } else {
-        ShowWarning("Unknown webhook for channel: %s\n", chan->name);
+        ShowWarning("async_hercules_echo: Unknown webhook for channel: %s\n", chan->name);
         curl_easy_cleanup(curl);
-        return;
+        return NULL;
     }
 
     struct curl_slist *headers = NULL;
@@ -81,10 +97,25 @@ void hercules_echo(struct channel_data *chan, struct map_session_data *sd, const
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        ShowWarning("curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        ShowWarning("async_hercules_echo: curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
     }
 
     curl_easy_cleanup(curl);
+
+    return NULL;
+}
+
+void hercules_echo(struct channel_data *chan, struct map_session_data *sd, const char *msg) {
+    // If character name starts with "<", it means that the message is from discord chat. Skip to call webhook
+    if (strncmp(sd->status.name, "<", 1) == 0) return;
+    
+    struct PostHookChannelSendParams params = {chan, sd, msg};
+    // Create a new thread to execute the async_hercules_echo function
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, async_hercules_echo, (void *)&params) != 0) {
+        ShowError("hercules_echo: Error creating thread\n");
+        return;
+    }
 }
 
 void discord_echo(int fd) {
@@ -92,7 +123,7 @@ void discord_echo(int fd) {
 
     struct map_session_data *sd = malloc(sizeof(struct map_session_data));
     if (!sd) {
-        ShowError("Failed to allocate memory for session data.\n");
+        ShowError("discord_echo: Failed to allocate memory for session data.\n");
         return;
     }
 
@@ -101,7 +132,7 @@ void discord_echo(int fd) {
 
     struct channel_data *chan = channel->search(packet->channel, sd);
     if (!chan) {
-        ShowWarning("Channel not found: %s\n", packet->channel);
+        ShowWarning("discord_echo: Channel not found: %s\n", packet->channel);
         free(sd);
         return;
     }
