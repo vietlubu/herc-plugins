@@ -24,31 +24,54 @@
 #include "common/socket.h"
 #include "map/pc.h"
 #include "map/channel.h"
+#include "api/jsonparser.h"
 #include "plugins/HPMHooking.h"
 #include "common/HPMDataCheck.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include <pthread.h>
-#include <curl/curl.h>
+#include <concord/discord.h>
 
-#define MAX_NAME_LENGTH  NAME_LENGTH
-#define MAX_MESSAGE_LENGTH 250
+#define DISCORD_CONFIG "conf/import/discord.conf"
 
-struct PACKET_DISCORD_MESSAGE {
-    int16_t packet_id;   // Packet ID (0x0F01)
-    char channel[MAX_NAME_LENGTH];
-    char username[MAX_NAME_LENGTH];
-    char message[MAX_MESSAGE_LENGTH];
-} __attribute__((packed));
-
+// PostHookChannelSendParams using to pass param to thread
 struct PostHookChannelSendParams {
     struct channel_data *chan;
     struct map_session_data *sd;
     const char *msg;
 };
 
+// Define global structs and variables
+struct discord *discord_client;
+struct config_t config;
+const char *discord_bot_token = NULL;
+const struct config_setting_t *discord_channels = NULL;
+
+/**
+ * Function to get channel config by key and value
+*/
+struct config_setting_t *get_channel_config(const char *key, const char *value) {
+    ShowInfo("key: %s - value: %s\n", key, value);
+    struct config_setting_t *channel = NULL;
+    for (int channel_index = 0; channel_index < libconfig->setting_length(discord_channels); channel_index++) {
+        channel = libconfig->setting_get_elem(discord_channels, channel_index);
+        const char *find_value = NULL;
+        libconfig->lookup_string(&channel, key, &find_value);
+        if (strcmp(find_value, value) == 0) {
+            return channel;
+        } else {
+            channel = NULL;
+        }
+    }
+    return channel;
+}
+
+/**
+ * async function to send message in-game to discord
+*/
 void* async_hercules_echo(void *arg) {
     // Cast the void pointer to the correct type
     struct PostHookChannelSendParams *params = (struct PostHookChannelSendParams *)arg;
@@ -58,57 +81,40 @@ void* async_hercules_echo(void *arg) {
     struct map_session_data *sd = params->sd;
     const char *msg = params->msg;
 
-    // Handle after send message to channel
-    ShowDebug("async_hercules_echo: Sending message to channel: %s\n", chan->name);
+    char *webhook_id_str = NULL;
+    char *webhook_token = NULL;
 
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        ShowError("async_hercules_echo: Failed to initialize CURL.\n");
+    struct config_setting_t *find_channel = get_channel_config("ingame_channel", chan->name);
+    if (find_channel != NULL) {
+        libconfig->lookup_string(&find_channel, "discord_webhook_id", &webhook_id_str);
+        libconfig->lookup_string(&find_channel, "discord_webhook_token", &webhook_token);
+    }
+
+    if (webhook_id_str == NULL || webhook_token == NULL) {
+        ShowWarning("Cannot find channel conf for [%s]\n", chan->name);
         return NULL;
     }
 
-    const char *webhook_urls[] = {
-        "https://discord.com/api/webhooks/webhook_id/webhook_token",
-        "https://discord.com/api/webhooks/webhook_id/webhook_token",
-        "https://discord.com/api/webhooks/webhook_id/webhook_token"
+    u64snowflake webhook_id = strtoull(webhook_id_str, NULL, 10);
+    
+    struct discord_ret ret = { .sync = true };
+    struct discord_execute_webhook webhook_params = {
+        .username = sd->status.name,
+        .content = msg
     };
-
-    const char *webhook_url = NULL;
-    if (strcmp(chan->name, "main") == 0) {
-        webhook_url = webhook_urls[0];
-    } else if (strcmp(chan->name, "trade") == 0) {
-        webhook_url = webhook_urls[1];
-    } else if (strcmp(chan->name, "support") == 0) {
-        webhook_url = webhook_urls[2];
-    } else {
-        ShowWarning("async_hercules_echo: Unknown webhook for channel: %s\n", chan->name);
-        curl_easy_cleanup(curl);
-        return NULL;
-    }
-
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    char postfields[2000];
-    snprintf(postfields, sizeof(postfields), "{ \"username\": \"%s\", \"avatar_url\": \"https://i.imgur.com/4M34hi2.png\", \"content\": \"%s\" }", sd->status.name, msg);
-    curl_easy_setopt(curl, CURLOPT_URL, webhook_url);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields);
-
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        ShowWarning("async_hercules_echo: curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-    }
-
-    curl_easy_cleanup(curl);
+    discord_execute_webhook(discord_client, webhook_id, webhook_token, &webhook_params, &ret);
 
     return NULL;
 }
 
+/**
+ * Function called after channel->send()
+*/
 void hercules_echo(struct channel_data *chan, struct map_session_data *sd, const char *msg) {
     // If character name starts with "<", it means that the message is from discord chat. Skip to call webhook
-    if (strncmp(sd->status.name, "<", 1) == 0) return;
-    
+    // fd = 0 that mean that session is not from game client
+    if (strncmp(sd->status.name, "<", 1) == 0 || sd->fd == 0) return;
+
     struct PostHookChannelSendParams params = {chan, sd, msg};
     // Create a new thread to execute the async_hercules_echo function
     pthread_t thread;
@@ -118,37 +124,100 @@ void hercules_echo(struct channel_data *chan, struct map_session_data *sd, const
     }
 }
 
-void discord_echo(int fd) {
-    const struct PACKET_DISCORD_MESSAGE *packet = RP2PTR(fd);
+/**
+ * Logging after discor bot ready
+*/
+void discord_bot_on_ready(struct discord *discord_client, const struct discord_ready *event) {
+    ShowStatus("discord_bot_on_ready: Logged in as %s!\n", event->user->username);
+}
+
+/**
+ * Tracking discord has new message
+*/
+void discord_bot_on_message(struct discord *discord_client, const struct discord_message *event) {
+    if (event->author->bot) return;
+
+    char username[34];
+    strcpy(username, "<");
+    strcat(username, event->author->username);
+    strcat(username, ">");
 
     struct map_session_data *sd = malloc(sizeof(struct map_session_data));
+    sd->fd = 0;
     if (!sd) {
-        ShowError("discord_echo: Failed to allocate memory for session data.\n");
+        ShowError("discord_bot_on_message: Failed to allocate memory for session data.\n");
         return;
     }
 
-    safestrncpy(sd->status.name, packet->username, MAX_NAME_LENGTH);
-    sd->fd = fd;
+    safestrncpy(sd->status.name, username, NAME_LENGTH);
 
-    struct channel_data *chan = channel->search(packet->channel, sd);
-    if (!chan) {
-        ShowWarning("discord_echo: Channel not found: %s\n", packet->channel);
+    char channel_id[20+1];
+    sprintf(channel_id, "%llu", (unsigned long long)event->channel_id);
+    
+    if (channel_id == NULL) {
+        ShowWarning("discord_bot_on_message: Channel ID is NULL\n");
+        free(sd);
+        return;
+    }
+    
+    struct config_setting_t *find_channel = get_channel_config("discord_channel_id", channel_id);
+    const char *channel_name = NULL;
+    libconfig->lookup_string(&find_channel, "ingame_channel", &channel_name);
+    if (!channel_name) {
+        ShowWarning("discord_bot_on_message: Channel config not found: %s\n", event->channel_id);
         free(sd);
         return;
     }
 
-    channel->send(chan, sd, packet->message);
+    struct channel_data *chan = channel->search(channel_name, sd);
+
+    if (!chan) {
+        ShowWarning("discord_bot_on_message: Channel not found: %s\n", channel_name);
+        free(sd);
+        return;
+    }
+
+    channel->send(chan, sd, event->content);
     free(sd);
+}
+
+/**
+ * async function to start discord bot
+*/
+void* async_start_discord_bot(void) {
+    discord_client = discord_init(discord_bot_token);
+
+    discord_add_intents(discord_client, DISCORD_GATEWAY_MESSAGE_CONTENT);
+    discord_set_on_ready(discord_client, &discord_bot_on_ready);
+    discord_set_on_message_create(discord_client, &discord_bot_on_message);
+    discord_run(discord_client);
+    return NULL;
 }
 
 HPExport struct hplugin_info pinfo = {
     "discord-echo",
     SERVER_TYPE_MAP,
-    "1.0",
+    "0.1",
     HPM_VERSION,
 };
 
 HPExport void plugin_init(void) {
-    addPacket(0x0F01, 300, discord_echo, hpClif_Parse);
     addHookPost(channel, send, hercules_echo);
+}
+
+HPExport void server_online (void) {
+    // Load discord configuration
+    libconfig->load_file(&config, DISCORD_CONFIG);
+    libconfig->lookup_string(&config, "discord_configuration/token", &discord_bot_token);
+    discord_channels = libconfig->lookup(&config, "discord_configuration/channels");
+
+    pthread_t discord_bot_thread;
+    if (pthread_create(&discord_bot_thread, NULL, async_start_discord_bot, NULL) != 0) {
+        ShowError("hercules_echo: Error creating discord_bot_thread\n");
+        return;
+    }
+}
+
+HPExport void server_post_final (void) {
+    discord_shutdown(discord_client);
 }
