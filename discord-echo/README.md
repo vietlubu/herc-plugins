@@ -1,6 +1,10 @@
 # Discord Echo plugin
 ## About:
-![](https://i.imgur.com/fLamjTb.mp4)
+
+
+https://github.com/vietlubu/herc-plugins/assets/9859310/dd16dd37-97a6-419c-9bd4-e478deac5119
+
+
 
 - Sync chat messages between Discord and In-game channel chat
 - Change Discord name  by In-game name.
