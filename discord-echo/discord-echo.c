@@ -99,6 +99,7 @@ void* async_hercules_echo(void *arg) {
     
     struct discord_ret ret = { .sync = true };
     struct discord_execute_webhook webhook_params = {
+        // .avatar_url = "",
         .username = sd->status.name,
         .content = msg
     };
