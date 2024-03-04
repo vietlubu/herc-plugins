@@ -42,8 +42,7 @@ Note: `hercules-echo.py` dont need anymore
 - Plugin trigger after send message
 - Execute webhook with custom name
 
-### Build/run note:
-- Maybe you need to add `-ldiscord -lcurl` to `src/plugins/Makefile`. Add that after `-lpcre`
+### Config info:
 - Create Discord bot, get token and put to `conf/import/discord.conf`
 - Create Discord channel webhook and put webhook_id, webhook token to `conf/import/discord.conf`
 - Add `discord-echo` plugin to `conf/plugins.conf`

@@ -19,6 +19,10 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+/*
+-ldiscord -lcurl #PLUGINFLAGS
+*/
+
 #include "common/hercules.h"
 #include "common/memmgr.h"
 #include "common/socket.h"
