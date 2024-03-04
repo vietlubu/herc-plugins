@@ -20,7 +20,7 @@
  */
 
 /*
--ldiscord -lcurl #PLUGINFLAGS
+-ldiscord -lcurl -lpthread #PLUGINFLAGS
 */
 
 #include "common/hercules.h"
